@@ -65,8 +65,13 @@ class CPUPlayer {
       this.score += Math.floor(Math.random() * 50) + 10;
       this.linesCleared += Math.floor(Math.random() * 2);
 
+      // フィールドを動的に生成（ランダムブロック配置）
+      this.generateRandomField();
+
       // ランダムでミスる（死ぬ）
-      if (Math.random() < 0.001) {
+      const deathChance = this.difficulty === 'easy' ? 0.002 : 
+                         this.difficulty === 'hard' ? 0.0005 : 0.001;
+      if (Math.random() < deathChance) {
         this.isAlive = false;
         this.die(room);
       }
@@ -74,6 +79,23 @@ class CPUPlayer {
       // 他のプレイヤーに更新を送信
       this.broadcastUpdate(room);
     }, speed);
+  }
+
+  generateRandomField() {
+    // フィールドの下部をランダムに埋める
+    const colors = ['#0ff', '#00f', '#f80', '#ff0', '#0f0', '#a0f', '#f00'];
+    const fillLines = Math.floor(this.score / 500); // スコアに応じて埋まっていく
+    const maxFillLines = Math.min(fillLines, 15);
+    
+    for (let y = 19; y > 19 - maxFillLines; y--) {
+      for (let x = 0; x < 10; x++) {
+        if (Math.random() < 0.7) {
+          this.field[y][x] = colors[Math.floor(Math.random() * colors.length)];
+        } else {
+          this.field[y][x] = "";
+        }
+      }
+    }
   }
 
   stop() {
@@ -109,11 +131,12 @@ class CPUPlayer {
 
 // Roomクラス
 class Room {
-  constructor(id, name, password = null, maxPlayers = 99) {
+  constructor(id, name, password = null, maxPlayers = 99, isQuickMatch = false) {
     this.id = id;
     this.name = name;
     this.password = password;
     this.maxPlayers = maxPlayers;
+    this.isQuickMatch = isQuickMatch; // クイックマッチかどうか
     this.players = new Map();
     this.cpuPlayers = new Map();
     this.gameStarted = false;
@@ -199,16 +222,23 @@ class Room {
       this.matchTimer = null;
     }
 
-    // CPU補充
-    if (CONFIG.CPU_FILL_ENABLED) {
+    // CPU補充（クイックマッチのみ）
+    if (CONFIG.CPU_FILL_ENABLED && this.isQuickMatch) {
       const currentPlayers = this.players.size + this.cpuPlayers.size;
-      const needed = CONFIG.IDEAL_PLAYERS - currentPlayers;
+      
+      // 現在のプレイヤー数に応じてCPU数を決定（大幅に増加）
+      let targetTotal = 50; // デフォルトは50人
+      if (currentPlayers <= 2) targetTotal = 80; // 2人以下なら80人
+      else if (currentPlayers <= 5) targetTotal = 60; // 5人以下なら60人
+      
+      const needed = targetTotal - currentPlayers;
       
       if (needed > 0) {
-        console.log(`Adding ${needed} CPU players to reach ${CONFIG.IDEAL_PLAYERS}`);
+        console.log(`Adding ${needed} CPU players to reach ${targetTotal} total (Quick Match only)`);
         for (let i = 0; i < needed; i++) {
-          const difficulty = Math.random() < 0.3 ? 'easy' : 
-                           Math.random() < 0.7 ? 'normal' : 'hard';
+          const rand = Math.random();
+          const difficulty = rand < 0.2 ? 'easy' : 
+                           rand < 0.7 ? 'normal' : 'hard';
           this.addCPU(difficulty);
         }
       }
@@ -229,7 +259,7 @@ class Room {
       players: allPlayers
     });
 
-    console.log(`Game started in room ${this.id} with ${allPlayers.length} players`);
+    console.log(`Game started in room ${this.id} with ${allPlayers.length} players (${this.players.size} human, ${this.cpuPlayers.size} CPU)`);
   }
 
   endGame() {
@@ -319,7 +349,7 @@ function tryMatchmaking(rank) {
 
 function createMatch(players, rank) {
   const roomId = `match_${Date.now()}_${generateId()}`;
-  const room = new Room(roomId, `Rank ${rank} Match`, null, CONFIG.MAX_PLAYERS);
+  const room = new Room(roomId, `Rank ${rank} Match`, null, CONFIG.MAX_PLAYERS, true); // isQuickMatch = true
   rooms.set(roomId, room);
 
   console.log(`Created match ${roomId} for ${players.length} players`);
