@@ -48,12 +48,257 @@ class CPUPlayer {
     this.isAlive = true;
     this.field = Array.from({length: 20}, () => Array(10).fill(""));
     this.updateInterval = null;
+    this.currentPiece = null;
+    this.nextPiece = null;
+    this.bag = [];
+    this.pieceTypes = ['I', 'J', 'L', 'O', 'S', 'T', 'Z'];
+    this.colors = {
+      'I': '#0ff', 'J': '#00f', 'L': '#f80', 
+      'O': '#ff0', 'S': '#0f0', 'T': '#a0f', 'Z': '#f00'
+    };
+    this.shapes = {
+      'I': [[1,1,1,1]],
+      'J': [[1,0,0],[1,1,1]],
+      'L': [[0,0,1],[1,1,1]],
+      'O': [[1,1],[1,1]],
+      'S': [[0,1,1],[1,1,0]],
+      'T': [[0,1,0],[1,1,1]],
+      'Z': [[1,1,0],[0,1,1]]
+    };
+  }
+
+  refillBag() {
+    this.bag = [...this.pieceTypes].sort(() => Math.random() - 0.5);
+  }
+
+  getNextPiece() {
+    if (this.bag.length === 0) this.refillBag();
+    const type = this.bag.pop();
+    return {
+      type: type,
+      shape: JSON.parse(JSON.stringify(this.shapes[type])),
+      color: this.colors[type],
+      x: 3,
+      y: 0
+    };
+  }
+
+  checkCollision(x, y, shape) {
+    for (let row = 0; row < shape.length; row++) {
+      for (let col = 0; col < shape[row].length; col++) {
+        if (shape[row][col]) {
+          const newY = y + row;
+          const newX = x + col;
+          
+          if (newX < 0 || newX >= 10 || newY >= 20) return true;
+          if (newY >= 0 && this.field[newY][newX]) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  mergePiece() {
+    if (!this.currentPiece) return;
+    
+    for (let row = 0; row < this.currentPiece.shape.length; row++) {
+      for (let col = 0; col < this.currentPiece.shape[row].length; col++) {
+        if (this.currentPiece.shape[row][col]) {
+          const y = this.currentPiece.y + row;
+          const x = this.currentPiece.x + col;
+          if (y >= 0 && y < 20 && x >= 0 && x < 10) {
+            this.field[y][x] = this.currentPiece.color;
+          }
+        }
+      }
+    }
+  }
+
+  clearLines() {
+    let linesCleared = 0;
+    
+    for (let y = 19; y >= 0; y--) {
+      if (this.field[y].every(cell => cell !== "")) {
+        this.field.splice(y, 1);
+        this.field.unshift(Array(10).fill(""));
+        linesCleared++;
+        y++; // 同じ行を再チェック
+      }
+    }
+    
+    if (linesCleared > 0) {
+      this.linesCleared += linesCleared;
+      const points = [0, 100, 300, 500, 800][linesCleared];
+      this.score += points;
+    }
+    
+    return linesCleared;
+  }
+
+  findBestMove() {
+    if (!this.currentPiece) return null;
+    
+    let bestScore = -Infinity;
+    let bestMove = null;
+    
+    // すべての回転とX位置を試す
+    for (let rotation = 0; rotation < 4; rotation++) {
+      let testShape = JSON.parse(JSON.stringify(this.currentPiece.shape));
+      
+      // 回転
+      for (let r = 0; r < rotation; r++) {
+        testShape = this.rotateShape(testShape);
+      }
+      
+      // すべてのX位置を試す
+      for (let x = -2; x < 10; x++) {
+        // ハードドロップ
+        let y = 0;
+        while (!this.checkCollision(x, y + 1, testShape)) {
+          y++;
+        }
+        
+        if (this.checkCollision(x, y, testShape)) continue;
+        
+        // この位置の評価
+        const score = this.evaluatePosition(x, y, testShape);
+        
+        if (score > bestScore) {
+          bestScore = score;
+          bestMove = { x, y, shape: testShape };
+        }
+      }
+    }
+    
+    return bestMove;
+  }
+
+  rotateShape(shape) {
+    const rows = shape.length;
+    const cols = shape[0].length;
+    const rotated = Array.from({length: cols}, () => Array(rows).fill(0));
+    
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        rotated[c][rows - 1 - r] = shape[r][c];
+      }
+    }
+    
+    return rotated;
+  }
+
+  evaluatePosition(x, y, shape) {
+    // 簡易評価関数
+    let score = 0;
+    
+    // 高さペナルティ（低いほど良い）
+    score -= y * 10;
+    
+    // 穴のペナルティ
+    const testField = JSON.parse(JSON.stringify(this.field));
+    
+    // シミュレーション配置
+    for (let row = 0; row < shape.length; row++) {
+      for (let col = 0; col < shape[row].length; col++) {
+        if (shape[row][col]) {
+          const newY = y + row;
+          const newX = x + col;
+          if (newY >= 0 && newY < 20 && newX >= 0 && newX < 10) {
+            testField[newY][newX] = 'X';
+          }
+        }
+      }
+    }
+    
+    // 穴の数をカウント
+    let holes = 0;
+    for (let col = 0; col < 10; col++) {
+      let blockFound = false;
+      for (let row = 0; row < 20; row++) {
+        if (testField[row][col]) {
+          blockFound = true;
+        } else if (blockFound) {
+          holes++;
+        }
+      }
+    }
+    
+    score -= holes * 50;
+    
+    // ラインクリアボーナス
+    let completeLines = 0;
+    for (let row = 0; row < 20; row++) {
+      if (testField[row].every(cell => cell)) {
+        completeLines++;
+      }
+    }
+    score += completeLines * 100;
+    
+    return score;
+  }
+
+  playMove() {
+    if (!this.currentPiece) {
+      this.currentPiece = this.getNextPiece();
+      this.nextPiece = this.getNextPiece();
+      
+      // ゲームオーバーチェック
+      if (this.checkCollision(this.currentPiece.x, this.currentPiece.y, this.currentPiece.shape)) {
+        return false; // Game Over
+      }
+    }
+    
+    // 最適な手を探す
+    const bestMove = this.findBestMove();
+    
+    if (bestMove) {
+      this.currentPiece.x = bestMove.x;
+      this.currentPiece.y = bestMove.y;
+      this.currentPiece.shape = bestMove.shape;
+    }
+    
+    // ピースを配置
+    this.mergePiece();
+    const lines = this.clearLines();
+    
+    // 次のピース
+    this.currentPiece = this.nextPiece;
+    this.nextPiece = this.getNextPiece();
+    
+    // ゲームオーバーチェック
+    if (this.checkCollision(this.currentPiece.x, this.currentPiece.y, this.currentPiece.shape)) {
+      return false;
+    }
+    
+    return true;
   }
 
   start(room) {
-    // CPUの自動プレイ（簡易版）
-    const speed = this.difficulty === 'easy' ? 3000 : 
-                  this.difficulty === 'hard' ? 800 : 1500;
+    // 難易度とルームランクによる速度調整
+    let baseSpeed = this.difficulty === 'easy' ? 2000 : 
+                    this.difficulty === 'hard' ? 500 : 1000;
+    
+    // ルームランクによる速度補正（高ランクほど速い）
+    const rankMultipliers = {
+      'F': 1.5,   // 遅い
+      'E': 1.3,
+      'D': 1.1,
+      'C': 1.0,   // 標準
+      'B': 0.9,
+      'A': 0.8,
+      'S': 0.7,
+      'S+': 0.6,
+      'S++': 0.5  // 速い
+    };
+    
+    const multiplier = rankMultipliers[room.rank] || 1.0;
+    const speed = Math.floor(baseSpeed * multiplier);
+    
+    console.log(`CPU ${this.name} starting with speed ${speed}ms (difficulty: ${this.difficulty}, rank: ${room.rank})`);
+    
+    // 初期化
+    this.currentPiece = this.getNextPiece();
+    this.nextPiece = this.getNextPiece();
     
     this.updateInterval = setInterval(() => {
       if (!this.isAlive || !room.gameStarted) {
@@ -61,40 +306,69 @@ class CPUPlayer {
         return;
       }
 
-      // スコアを増やす
-      this.score += Math.floor(Math.random() * 50) + 10;
-      this.linesCleared += Math.floor(Math.random() * 2);
-
-      // フィールドを動的に生成（ランダムブロック配置）
-      this.generateRandomField();
-
-      // ランダムでミスる（死ぬ）
-      const deathChance = this.difficulty === 'easy' ? 0.002 : 
-                         this.difficulty === 'hard' ? 0.0005 : 0.001;
-      if (Math.random() < deathChance) {
-        this.isAlive = false;
+      // テトリスをプレイ
+      const alive = this.playMove();
+      
+      if (!alive) {
         this.die(room);
+        return;
       }
 
       // 他のプレイヤーに更新を送信
       this.broadcastUpdate(room);
+      
+      // ランクに応じた攻撃頻度
+      const attackRates = {
+        'F': 0.15,
+        'E': 0.20,
+        'D': 0.25,
+        'C': 0.30,
+        'B': 0.35,
+        'A': 0.40,
+        'S': 0.45,
+        'S+': 0.50,
+        'S++': 0.55
+      };
+      
+      const attackRate = attackRates[room.rank] || 0.30;
+      
+      if (Math.random() < attackRate) {
+        this.sendAttack(room);
+      }
     }, speed);
   }
 
-  generateRandomField() {
-    // フィールドの下部をランダムに埋める
-    const colors = ['#0ff', '#00f', '#f80', '#ff0', '#0f0', '#a0f', '#f00'];
-    const fillLines = Math.floor(this.score / 500); // スコアに応じて埋まっていく
-    const maxFillLines = Math.min(fillLines, 15);
+  sendAttack(room) {
+    const lines = Math.floor(Math.random() * 3) + 1; // 1-3ライン
     
-    for (let y = 19; y > 19 - maxFillLines; y--) {
-      for (let x = 0; x < 10; x++) {
-        if (Math.random() < 0.7) {
-          this.field[y][x] = colors[Math.floor(Math.random() * colors.length)];
-        } else {
-          this.field[y][x] = "";
-        }
+    // ランダムなターゲットを選択
+    const alivePlayers = Array.from(room.players.values())
+      .filter(p => p.isAlive);
+    
+    if (alivePlayers.length > 0) {
+      const target = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
+      
+      if (target.ws && target.ws.readyState === 1) { // WebSocket.OPEN
+        target.ws.send(JSON.stringify({
+          type: 'attacked',
+          fromPlayerId: this.id,
+          lines: lines
+        }));
       }
+    }
+  }
+
+  receiveAttack(lines) {
+    // ゴミラインを追加
+    for (let i = 0; i < lines; i++) {
+      this.field.pop(); // 上の行を削除
+      
+      // 下にゴミラインを追加（ランダムな穴）
+      const garbageLine = Array(10).fill('#808080');
+      const holePos = Math.floor(Math.random() * 10);
+      garbageLine[holePos] = "";
+      
+      this.field.push(garbageLine);
     }
   }
 
@@ -131,12 +405,13 @@ class CPUPlayer {
 
 // Roomクラス
 class Room {
-  constructor(id, name, password = null, maxPlayers = 99, isQuickMatch = false) {
+  constructor(id, name, password = null, maxPlayers = 99, isQuickMatch = false, rank = 'C') {
     this.id = id;
     this.name = name;
     this.password = password;
     this.maxPlayers = maxPlayers;
     this.isQuickMatch = isQuickMatch; // クイックマッチかどうか
+    this.rank = rank; // マッチのランク
     this.players = new Map();
     this.cpuPlayers = new Map();
     this.gameStarted = false;
@@ -214,6 +489,23 @@ class Room {
     }, CONFIG.MATCH_TIMEOUT);
   }
 
+  getCPUDifficultyDistribution(rank) {
+    // ランクに応じたCPU難易度分布
+    const distributions = {
+      'F': { easy: 0.70, normal: 0.25, hard: 0.05 },  // F: 初心者向け
+      'E': { easy: 0.60, normal: 0.30, hard: 0.10 },
+      'D': { easy: 0.50, normal: 0.35, hard: 0.15 },
+      'C': { easy: 0.30, normal: 0.50, hard: 0.20 },  // C: バランス
+      'B': { easy: 0.20, normal: 0.50, hard: 0.30 },
+      'A': { easy: 0.10, normal: 0.45, hard: 0.45 },
+      'S': { easy: 0.05, normal: 0.35, hard: 0.60 },
+      'S+': { easy: 0.02, normal: 0.28, hard: 0.70 },
+      'S++': { easy: 0.00, normal: 0.20, hard: 0.80 }  // S++: 上級者向け
+    };
+    
+    return distributions[rank] || distributions['C']; // デフォルトはC
+  }
+
   startGame() {
     if (this.gameStarted) return;
     
@@ -234,11 +526,23 @@ class Room {
       const needed = targetTotal - currentPlayers;
       
       if (needed > 0) {
-        console.log(`Adding ${needed} CPU players to reach ${targetTotal} total (Quick Match only)`);
+        console.log(`Adding ${needed} CPU players to reach ${targetTotal} total (Rank: ${this.rank})`);
+        
+        // ランクに応じた難易度分布
+        const difficultyDistribution = this.getCPUDifficultyDistribution(this.rank);
+        
         for (let i = 0; i < needed; i++) {
           const rand = Math.random();
-          const difficulty = rand < 0.2 ? 'easy' : 
-                           rand < 0.7 ? 'normal' : 'hard';
+          let difficulty = 'normal';
+          
+          if (rand < difficultyDistribution.easy) {
+            difficulty = 'easy';
+          } else if (rand < difficultyDistribution.easy + difficultyDistribution.normal) {
+            difficulty = 'normal';
+          } else {
+            difficulty = 'hard';
+          }
+          
           this.addCPU(difficulty);
         }
       }
@@ -321,6 +625,16 @@ function generateId() {
   return Math.random().toString(36).substr(2, 9);
 }
 
+function generateRoomCode() {
+  // 6桁の大文字英数字コード
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 紛らわしい文字を除外
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
 function broadcastToRoom(roomId, message, excludeWs = null) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -349,10 +663,10 @@ function tryMatchmaking(rank) {
 
 function createMatch(players, rank) {
   const roomId = `match_${Date.now()}_${generateId()}`;
-  const room = new Room(roomId, `Rank ${rank} Match`, null, CONFIG.MAX_PLAYERS, true); // isQuickMatch = true
+  const room = new Room(roomId, `Rank ${rank} Match`, null, CONFIG.MAX_PLAYERS, true, rank); // isQuickMatch = true, ランクも渡す
   rooms.set(roomId, room);
 
-  console.log(`Created match ${roomId} for ${players.length} players`);
+  console.log(`Created match ${roomId} for ${players.length} players (Rank: ${rank})`);
 
   players.forEach(playerInfo => {
     const { ws, playerId, username } = playerInfo;
@@ -555,10 +869,10 @@ function handleQuickMatch(ws, data) {
 
 function handleCreateRoom(ws, data) {
   const clientInfo = clients.get(ws);
-  const roomId = `room_${generateId()}`;
+  const roomId = generateRoomCode(); // 短い6桁コード
   const room = new Room(
     roomId,
-    data.roomName || 'Private Room',
+    `Room ${roomId}`, // 名前はコードと同じ
     data.password || null,
     data.maxPlayers || 99
   );
@@ -734,19 +1048,30 @@ function handleAttack(ws, data) {
   const room = rooms.get(clientInfo.roomId);
   if (!room) return;
 
-  // ランダムなターゲット選択
-  const alivePlayers = Array.from(room.players.values())
+  // 生存プレイヤー（人間＋CPU）からランダム選択
+  const aliveHumans = Array.from(room.players.values())
     .filter(p => p.isAlive && p.id !== clientInfo.id);
+  
+  const aliveCPUs = Array.from(room.cpuPlayers.values())
+    .filter(cpu => cpu.isAlive);
+  
+  const allTargets = [...aliveHumans, ...aliveCPUs];
 
-  if (alivePlayers.length > 0) {
-    const target = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
+  if (allTargets.length > 0) {
+    const target = allTargets[Math.floor(Math.random() * allTargets.length)];
     
-    if (target.ws && target.ws.readyState === WebSocket.OPEN) {
-      target.ws.send(JSON.stringify({
-        type: 'attacked',
-        fromPlayerId: clientInfo.id,
-        lines: data.lines || 1
-      }));
+    if (target.isCPU) {
+      // CPUへの攻撃
+      target.receiveAttack(data.lines || 1);
+    } else {
+      // 人間プレイヤーへの攻撃
+      if (target.ws && target.ws.readyState === 1) { // WebSocket.OPEN
+        target.ws.send(JSON.stringify({
+          type: 'attacked',
+          fromPlayerId: clientInfo.id,
+          lines: data.lines || 1
+        }));
+      }
     }
   }
 }
