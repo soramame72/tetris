@@ -1,14 +1,12 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const cron = require('node-cron');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
-const KEEPALIVE_URL = process.env.KEEPALIVE_URL;
 
 // CORS設定
 app.use((req, res, next) => {
@@ -20,59 +18,271 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// データ構造
-const rooms = new Map(); // roomId -> Room
-const quickMatchQueue = new Set(); // クイックマッチ待機中のクライアント
-const clients = new Map(); // ws -> ClientInfo
+// 設定
+const CONFIG = {
+  MATCH_TIMEOUT: 60000,           // 60秒待機
+  MIN_PLAYERS: 2,                 // 最小2人
+  IDEAL_PLAYERS: 4,               // 理想4人
+  MAX_PLAYERS: 99,                // 最大99人
+  ENABLE_RANK_MATCHING: true,     // ランクマッチング有効
+  CPU_FILL_ENABLED: true,         // CPU補充有効
+  GAME_START_COUNTDOWN: 3000,     // カウントダウン3秒
+};
 
+// データ構造
+const rooms = new Map();
+const clients = new Map();
+const rankQueues = {
+  'S++': [], 'S+': [], 'S': [], 'A': [], 'B': [], 'C': [], 'D': [], 'E': [], 'F': []
+};
+
+// CPU プレイヤークラス
+class CPUPlayer {
+  constructor(id, difficulty = 'normal') {
+    this.id = id;
+    this.name = `CPU-${difficulty.toUpperCase()}-${Math.floor(Math.random() * 100)}`;
+    this.isCPU = true;
+    this.difficulty = difficulty;
+    this.score = 0;
+    this.linesCleared = 0;
+    this.isAlive = true;
+    this.field = Array.from({length: 20}, () => Array(10).fill(""));
+    this.updateInterval = null;
+  }
+
+  start(room) {
+    // CPUの自動プレイ（簡易版）
+    const speed = this.difficulty === 'easy' ? 3000 : 
+                  this.difficulty === 'hard' ? 800 : 1500;
+    
+    this.updateInterval = setInterval(() => {
+      if (!this.isAlive || !room.gameStarted) {
+        this.stop();
+        return;
+      }
+
+      // スコアを増やす
+      this.score += Math.floor(Math.random() * 50) + 10;
+      this.linesCleared += Math.floor(Math.random() * 2);
+
+      // ランダムでミスる（死ぬ）
+      if (Math.random() < 0.001) {
+        this.isAlive = false;
+        this.die(room);
+      }
+
+      // 他のプレイヤーに更新を送信
+      this.broadcastUpdate(room);
+    }, speed);
+  }
+
+  stop() {
+    if (this.updateInterval) {
+      clearInterval(this.updateInterval);
+      this.updateInterval = null;
+    }
+  }
+
+  die(room) {
+    this.isAlive = false;
+    this.stop();
+    broadcastToRoom(room.id, {
+      type: 'playerDied',
+      playerId: this.id,
+      score: this.score
+    }, null);
+    
+    checkGameEnd(room);
+  }
+
+  broadcastUpdate(room) {
+    broadcastToRoom(room.id, {
+      type: 'playerUpdate',
+      playerId: this.id,
+      score: this.score,
+      linesCleared: this.linesCleared,
+      field: this.field,
+      currentPiece: null
+    }, null);
+  }
+}
+
+// Roomクラス
 class Room {
   constructor(id, name, password = null, maxPlayers = 99) {
     this.id = id;
     this.name = name;
     this.password = password;
     this.maxPlayers = maxPlayers;
-    this.players = new Map(); // playerId -> PlayerState
+    this.players = new Map();
+    this.cpuPlayers = new Map();
     this.gameStarted = false;
+    this.gameEnded = false;
     this.createdAt = Date.now();
+    this.matchTimer = null;
+    this.startTime = null;
   }
 
-  addPlayer(playerId, ws, playerName) {
+  addPlayer(playerId, ws, playerName, rank = 'C') {
     if (this.players.size >= this.maxPlayers) return false;
     
     this.players.set(playerId, {
       id: playerId,
       name: playerName,
+      rank: rank,
       ws: ws,
       score: 0,
       linesCleared: 0,
       isAlive: true,
       field: Array.from({length: 20}, () => Array(10).fill("")),
-      attackQueue: 0
     });
     
     return true;
   }
 
+  addCPU(difficulty = 'normal') {
+    const cpuId = `cpu_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const cpu = new CPUPlayer(cpuId, difficulty);
+    this.cpuPlayers.set(cpuId, cpu);
+    console.log(`Added CPU player: ${cpu.name}`);
+    return cpu;
+  }
+
   removePlayer(playerId) {
     this.players.delete(playerId);
+    
+    // CPU も削除
+    if (this.cpuPlayers.has(playerId)) {
+      const cpu = this.cpuPlayers.get(playerId);
+      cpu.stop();
+      this.cpuPlayers.delete(playerId);
+    }
   }
 
-  broadcast(data, excludePlayerId = null) {
-    this.players.forEach((player, id) => {
-      if (id !== excludePlayerId && player.ws.readyState === WebSocket.OPEN) {
-        player.ws.send(JSON.stringify(data));
-      }
-    });
-  }
-
-  getPlayerList() {
-    return Array.from(this.players.values()).map(p => ({
+  getAllPlayers() {
+    const humanPlayers = Array.from(this.players.values()).map(p => ({
       id: p.id,
       name: p.name,
+      rank: p.rank,
       score: p.score,
-      linesCleared: p.linesCleared,
-      isAlive: p.isAlive
+      isAlive: p.isAlive,
+      isCPU: false
     }));
+
+    const cpuPlayersList = Array.from(this.cpuPlayers.values()).map(cpu => ({
+      id: cpu.id,
+      name: cpu.name,
+      rank: 'C',
+      score: cpu.score,
+      isAlive: cpu.isAlive,
+      isCPU: true
+    }));
+
+    return [...humanPlayers, ...cpuPlayersList];
+  }
+
+  startMatchTimer() {
+    console.log(`Room ${this.id}: Starting 60s match timer`);
+    
+    // 60秒後に開始
+    this.matchTimer = setTimeout(() => {
+      console.log(`Room ${this.id}: Match timer expired, starting game`);
+      this.startGame();
+    }, CONFIG.MATCH_TIMEOUT);
+  }
+
+  startGame() {
+    if (this.gameStarted) return;
+    
+    if (this.matchTimer) {
+      clearTimeout(this.matchTimer);
+      this.matchTimer = null;
+    }
+
+    // CPU補充
+    if (CONFIG.CPU_FILL_ENABLED) {
+      const currentPlayers = this.players.size + this.cpuPlayers.size;
+      const needed = CONFIG.IDEAL_PLAYERS - currentPlayers;
+      
+      if (needed > 0) {
+        console.log(`Adding ${needed} CPU players to reach ${CONFIG.IDEAL_PLAYERS}`);
+        for (let i = 0; i < needed; i++) {
+          const difficulty = Math.random() < 0.3 ? 'easy' : 
+                           Math.random() < 0.7 ? 'normal' : 'hard';
+          this.addCPU(difficulty);
+        }
+      }
+    }
+
+    this.gameStarted = true;
+    this.gameEnded = false;
+    this.startTime = Date.now();
+
+    const allPlayers = this.getAllPlayers();
+
+    // CPUを開始
+    this.cpuPlayers.forEach(cpu => cpu.start(this));
+
+    // 全プレイヤーにゲーム開始を通知
+    broadcastToRoom(this.id, {
+      type: 'gameStart',
+      players: allPlayers
+    });
+
+    console.log(`Game started in room ${this.id} with ${allPlayers.length} players`);
+  }
+
+  endGame() {
+    if (this.gameEnded) return;
+    
+    this.gameEnded = true;
+    this.gameStarted = false;
+
+    // CPU停止
+    this.cpuPlayers.forEach(cpu => cpu.stop());
+
+    const rankings = this.calculateRankings();
+
+    broadcastToRoom(this.id, {
+      type: 'gameEnd',
+      rankings: rankings
+    });
+
+    console.log(`Game ended in room ${this.id}`);
+  }
+
+  calculateRankings() {
+    const allPlayers = [];
+
+    // 人間プレイヤー
+    this.players.forEach(p => {
+      allPlayers.push({
+        id: p.id,
+        name: p.name,
+        score: p.score,
+        isAlive: p.isAlive,
+        isCPU: false
+      });
+    });
+
+    // CPUプレイヤー
+    this.cpuPlayers.forEach(cpu => {
+      allPlayers.push({
+        id: cpu.id,
+        name: cpu.name,
+        score: cpu.score,
+        isAlive: cpu.isAlive,
+        isCPU: true
+      });
+    });
+
+    // スコアでソート（生存者優先、その後スコア順）
+    allPlayers.sort((a, b) => {
+      if (a.isAlive !== b.isAlive) return b.isAlive ? 1 : -1;
+      return b.score - a.score;
+    });
+
+    return allPlayers;
   }
 }
 
@@ -81,14 +291,88 @@ function generateId() {
   return Math.random().toString(36).substr(2, 9);
 }
 
-function generateRoomCode() {
-  return Math.random().toString(36).substr(2, 6).toUpperCase();
+function broadcastToRoom(roomId, message, excludeWs = null) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  const messageStr = JSON.stringify(message);
+  
+  room.players.forEach(player => {
+    if (player.ws && player.ws !== excludeWs && player.ws.readyState === WebSocket.OPEN) {
+      player.ws.send(messageStr);
+    }
+  });
 }
 
-// WebSocket接続
+function tryMatchmaking(rank) {
+  const queue = rankQueues[rank];
+  if (!queue || queue.length < CONFIG.MIN_PLAYERS) return;
+
+  console.log(`Attempting match for rank ${rank} with ${queue.length} players`);
+
+  // 理想人数に達したら即座にマッチ
+  if (queue.length >= CONFIG.IDEAL_PLAYERS) {
+    const matched = queue.splice(0, CONFIG.IDEAL_PLAYERS);
+    createMatch(matched, rank);
+  }
+}
+
+function createMatch(players, rank) {
+  const roomId = `match_${Date.now()}_${generateId()}`;
+  const room = new Room(roomId, `Rank ${rank} Match`, null, CONFIG.MAX_PLAYERS);
+  rooms.set(roomId, room);
+
+  console.log(`Created match ${roomId} for ${players.length} players`);
+
+  players.forEach(playerInfo => {
+    const { ws, playerId, username } = playerInfo;
+    room.addPlayer(playerId, ws, username, rank);
+    
+    const clientInfo = clients.get(ws);
+    if (clientInfo) {
+      clientInfo.roomId = roomId;
+    }
+  });
+
+  // 全員に通知
+  const allPlayers = room.getAllPlayers();
+  broadcastToRoom(roomId, {
+    type: 'quickMatchFound',
+    roomId: roomId,
+    players: allPlayers
+  });
+
+  // 60秒タイマー開始
+  room.startMatchTimer();
+}
+
+function checkGameEnd(room) {
+  if (room.gameEnded) return;
+
+  const alivePlayers = room.getAllPlayers().filter(p => p.isAlive);
+  
+  console.log(`Checking game end: ${alivePlayers.length} alive players`);
+
+  if (alivePlayers.length <= 1) {
+    room.endGame();
+  }
+}
+
+// WebSocket接続処理
 wss.on('connection', (ws) => {
   const clientId = generateId();
-  clients.set(ws, { id: clientId, roomId: null, name: 'Player' });
+  
+  clients.set(ws, {
+    id: clientId,
+    roomId: null,
+    username: 'Player',
+    rank: 'C'
+  });
+
+  ws.send(JSON.stringify({
+    type: 'connected',
+    clientId: clientId
+  }));
 
   console.log(`Client connected: ${clientId}`);
 
@@ -97,124 +381,185 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(message);
       handleMessage(ws, data);
     } catch (error) {
-      console.error('Error parsing message:', error);
+      console.error('Message parse error:', error);
     }
   });
 
   ws.on('close', () => {
-    const client = clients.get(ws);
-    if (client) {
-      console.log(`Client disconnected: ${client.id}`);
-      
-      // 部屋から退出
-      if (client.roomId) {
-        leaveRoom(ws, client.roomId);
-      }
-      
-      // クイックマッチキューから削除
-      quickMatchQueue.delete(ws);
-      
-      clients.delete(ws);
-    }
-  });
+    const clientInfo = clients.get(ws);
+    if (!clientInfo) return;
 
-  // 接続確認
-  ws.send(JSON.stringify({
-    type: 'connected',
-    clientId: clientId
-  }));
+    console.log(`Client disconnected: ${clientInfo.id}`);
+
+    // ルームから削除
+    if (clientInfo.roomId) {
+      const room = rooms.get(clientInfo.roomId);
+      if (room) {
+        room.removePlayer(clientInfo.id);
+        
+        broadcastToRoom(clientInfo.roomId, {
+          type: 'playerDisconnected',
+          playerId: clientInfo.id,
+          players: room.getAllPlayers()
+        }, ws);
+
+        // ゲーム中なら終了チェック
+        if (room.gameStarted) {
+          checkGameEnd(room);
+        }
+
+        // 部屋が空なら削除
+        if (room.players.size === 0) {
+          room.cpuPlayers.forEach(cpu => cpu.stop());
+          rooms.delete(clientInfo.roomId);
+          console.log(`Room ${clientInfo.roomId} deleted (empty)`);
+        }
+      }
+    }
+
+    // キューから削除
+    Object.values(rankQueues).forEach(queue => {
+      const index = queue.findIndex(p => p.ws === ws);
+      if (index !== -1) queue.splice(index, 1);
+    });
+
+    clients.delete(ws);
+  });
 });
 
 // メッセージハンドラ
 function handleMessage(ws, data) {
-  const client = clients.get(ws);
-  
+  const clientInfo = clients.get(ws);
+  if (!clientInfo) return;
+
   switch (data.type) {
-    case 'setName':
-      client.name = data.name;
-      break;
-
-    case 'createRoom':
-      createRoom(ws, data);
-      break;
-
-    case 'joinRoom':
-      joinRoom(ws, data);
-      break;
-
-    case 'leaveRoom':
-      leaveRoom(ws, client.roomId);
-      break;
-
     case 'quickMatch':
-      joinQuickMatch(ws);
+      handleQuickMatch(ws, data);
       break;
-
-    case 'getRooms':
-      sendRoomList(ws);
+      
+    case 'createRoom':
+      handleCreateRoom(ws, data);
       break;
-
+      
+    case 'joinRoom':
+      handleJoinRoom(ws, data);
+      break;
+      
+    case 'leaveRoom':
+      handleLeaveRoom(ws);
+      break;
+      
     case 'startGame':
-      startGame(client.roomId);
+      handleStartGame(ws);
       break;
-
+      
     case 'gameUpdate':
       handleGameUpdate(ws, data);
       break;
-
+      
     case 'gameOver':
       handleGameOver(ws, data);
       break;
-
+      
+    case 'requestGameEnd':
+      handleRequestGameEnd(ws);
+      break;
+      
     case 'attack':
       handleAttack(ws, data);
       break;
+      
+    case 'chat':
+      handleChat(ws, data);
+      break;
 
-    case 'ping':
-      ws.send(JSON.stringify({ type: 'pong' }));
+    case 'forceStart':
+      handleForceStart(ws);
       break;
   }
 }
 
-// ルーム作成
-function createRoom(ws, data) {
-  const client = clients.get(ws);
-  const roomId = generateRoomCode();
+function handleQuickMatch(ws, data) {
+  const clientInfo = clients.get(ws);
+  const rank = data.rank || 'C';
+  const username = data.username || 'Player';
+
+  clientInfo.username = username;
+  clientInfo.rank = rank;
+
+  console.log(`Quick match request: ${username} (${rank})`);
+
+  // キューに追加
+  if (!rankQueues[rank]) rankQueues[rank] = [];
+  rankQueues[rank].push({
+    ws,
+    playerId: clientInfo.id,
+    username,
+    rank,
+    joinedAt: Date.now()
+  });
+
+  ws.send(JSON.stringify({
+    type: 'quickMatchWaiting'
+  }));
+
+  // マッチング試行
+  tryMatchmaking(rank);
+
+  // 60秒後に強制マッチング
+  setTimeout(() => {
+    const queue = rankQueues[rank];
+    const playerIndex = queue.findIndex(p => p.ws === ws);
+    
+    if (playerIndex !== -1) {
+      // まだ待機中なら強制マッチ
+      console.log(`Force matching for rank ${rank} after 60s`);
+      
+      if (queue.length >= CONFIG.MIN_PLAYERS) {
+        const matched = queue.splice(0, Math.min(queue.length, CONFIG.MAX_PLAYERS));
+        createMatch(matched, rank);
+      }
+    }
+  }, CONFIG.MATCH_TIMEOUT);
+}
+
+function handleCreateRoom(ws, data) {
+  const clientInfo = clients.get(ws);
+  const roomId = `room_${generateId()}`;
   const room = new Room(
     roomId,
-    data.roomName || 'New Room',
+    data.roomName || 'Private Room',
     data.password || null,
     data.maxPlayers || 99
   );
 
   rooms.set(roomId, room);
-  room.addPlayer(client.id, ws, client.name);
-  client.roomId = roomId;
+  room.addPlayer(clientInfo.id, ws, data.username || 'Player');
+  clientInfo.roomId = roomId;
 
   ws.send(JSON.stringify({
     type: 'roomCreated',
-    roomId: roomId,
-    room: {
-      id: room.id,
-      name: room.name,
-      hasPassword: !!room.password,
-      playerCount: room.players.size,
-      maxPlayers: room.maxPlayers
-    }
+    roomId: roomId
   }));
 
   console.log(`Room created: ${roomId}`);
 }
 
-// ルーム参加
-function joinRoom(ws, data) {
-  const client = clients.get(ws);
+function handleJoinRoom(ws, data) {
   const room = rooms.get(data.roomId);
-
+  
   if (!room) {
     ws.send(JSON.stringify({
       type: 'error',
-      message: 'Room not found'
+      message: 'ルームが見つかりません'
+    }));
+    return;
+  }
+
+  if (room.gameStarted) {
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'ゲームは既に開始しています'
     }));
     return;
   }
@@ -222,273 +567,186 @@ function joinRoom(ws, data) {
   if (room.password && room.password !== data.password) {
     ws.send(JSON.stringify({
       type: 'error',
-      message: 'Incorrect password'
+      message: 'パスワードが正しくありません'
     }));
     return;
   }
 
-  if (!room.addPlayer(client.id, ws, client.name)) {
+  const clientInfo = clients.get(ws);
+  if (!room.addPlayer(clientInfo.id, ws, data.username || 'Player')) {
     ws.send(JSON.stringify({
       type: 'error',
-      message: 'Room is full'
+      message: 'ルームが満員です'
     }));
     return;
   }
 
-  client.roomId = data.roomId;
+  clientInfo.roomId = data.roomId;
 
   ws.send(JSON.stringify({
     type: 'roomJoined',
     roomId: data.roomId,
-    players: room.getPlayerList()
+    players: room.getAllPlayers()
   }));
 
-  room.broadcast({
+  broadcastToRoom(data.roomId, {
     type: 'playerJoined',
-    player: {
-      id: client.id,
-      name: client.name
-    }
-  }, client.id);
+    players: room.getAllPlayers()
+  }, ws);
 
-  console.log(`Player ${client.id} joined room ${data.roomId}`);
+  console.log(`Player joined room ${data.roomId}`);
 }
 
-// ルーム退出
-function leaveRoom(ws, roomId) {
-  if (!roomId) return;
+function handleLeaveRoom(ws) {
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
 
-  const client = clients.get(ws);
-  const room = rooms.get(roomId);
-
+  const room = rooms.get(clientInfo.roomId);
   if (room) {
-    room.removePlayer(client.id);
+    room.removePlayer(clientInfo.id);
     
-    room.broadcast({
+    broadcastToRoom(clientInfo.roomId, {
       type: 'playerLeft',
-      playerId: client.id
+      playerId: clientInfo.id,
+      players: room.getAllPlayers()
     });
 
-    // 部屋が空になったら削除
     if (room.players.size === 0) {
-      rooms.delete(roomId);
-      console.log(`Room ${roomId} deleted (empty)`);
+      room.cpuPlayers.forEach(cpu => cpu.stop());
+      rooms.delete(clientInfo.roomId);
     }
   }
 
-  client.roomId = null;
+  clientInfo.roomId = null;
 }
 
-// クイックマッチ
-function joinQuickMatch(ws) {
-  const client = clients.get(ws);
-  quickMatchQueue.add(ws);
+function handleStartGame(ws) {
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
 
-  // 2人以上集まったらマッチング
-  if (quickMatchQueue.size >= 2) {
-    const players = Array.from(quickMatchQueue).slice(0, 99);
-    const roomId = generateRoomCode();
-    const room = new Room(roomId, 'Quick Match', null, 99);
-
-    rooms.set(roomId, room);
-
-    players.forEach(playerWs => {
-      const playerClient = clients.get(playerWs);
-      room.addPlayer(playerClient.id, playerWs, playerClient.name);
-      playerClient.roomId = roomId;
-      quickMatchQueue.delete(playerWs);
-
-      playerWs.send(JSON.stringify({
-        type: 'quickMatchFound',
-        roomId: roomId,
-        players: room.getPlayerList()
-      }));
-    });
-
-    // 3秒後にゲーム開始
-    setTimeout(() => startGame(roomId), 3000);
-  } else {
-    ws.send(JSON.stringify({
-      type: 'quickMatchWaiting',
-      queueSize: quickMatchQueue.size
-    }));
+  const room = rooms.get(clientInfo.roomId);
+  if (room) {
+    room.startGame();
   }
 }
 
-// ルームリスト送信
-function sendRoomList(ws) {
-  const roomList = Array.from(rooms.values())
-    .filter(room => !room.gameStarted)
-    .map(room => ({
-      id: room.id,
-      name: room.name,
-      hasPassword: !!room.password,
-      playerCount: room.players.size,
-      maxPlayers: room.maxPlayers
-    }));
+function handleForceStart(ws) {
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
 
-  ws.send(JSON.stringify({
-    type: 'roomList',
-    rooms: roomList
-  }));
+  const room = rooms.get(clientInfo.roomId);
+  if (room && !room.gameStarted) {
+    console.log(`Force starting game in room ${room.id}`);
+    room.startGame();
+  }
 }
 
-// ゲーム開始
-function startGame(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-
-  room.gameStarted = true;
-
-  room.broadcast({
-    type: 'gameStart',
-    players: room.getPlayerList()
-  });
-
-  console.log(`Game started in room ${roomId}`);
-}
-
-// ゲーム状態更新
 function handleGameUpdate(ws, data) {
-  const client = clients.get(ws);
-  const room = rooms.get(client.roomId);
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
+
+  const room = rooms.get(clientInfo.roomId);
   if (!room) return;
 
-  const player = room.players.get(client.id);
+  const player = room.players.get(clientInfo.id);
   if (player) {
-    player.score = data.score;
-    player.linesCleared = data.linesCleared;
-    player.field = data.field;
+    player.score = data.score || 0;
+    player.linesCleared = data.linesCleared || 0;
+    player.field = data.field || player.field;
   }
 
-  room.broadcast({
+  broadcastToRoom(clientInfo.roomId, {
     type: 'playerUpdate',
-    playerId: client.id,
+    playerId: clientInfo.id,
     score: data.score,
     linesCleared: data.linesCleared,
-    field: data.field
-  }, client.id);
+    field: data.field,
+    currentPiece: data.currentPiece
+  }, ws);
 }
 
-// ゲームオーバー
 function handleGameOver(ws, data) {
-  const client = clients.get(ws);
-  const room = rooms.get(client.roomId);
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
+
+  const room = rooms.get(clientInfo.roomId);
   if (!room) return;
 
-  const player = room.players.get(client.id);
+  const player = room.players.get(clientInfo.id);
   if (player) {
     player.isAlive = false;
+    player.score = data.score || 0;
   }
 
-  room.broadcast({
+  broadcastToRoom(clientInfo.roomId, {
     type: 'playerDied',
-    playerId: client.id,
-    finalScore: data.score
+    playerId: clientInfo.id,
+    score: data.score
   });
 
-  // 生き残りが1人以下ならゲーム終了
-  const alivePlayers = Array.from(room.players.values()).filter(p => p.isAlive);
-  if (alivePlayers.length <= 1) {
-    room.broadcast({
-      type: 'gameEnd',
-      winner: alivePlayers[0]?.id,
-      rankings: room.getPlayerList().sort((a, b) => b.score - a.score)
-    });
+  checkGameEnd(room);
+}
+
+function handleRequestGameEnd(ws) {
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
+
+  const room = rooms.get(clientInfo.roomId);
+  if (room) {
+    checkGameEnd(room);
   }
 }
 
-// 攻撃処理
 function handleAttack(ws, data) {
-  const client = clients.get(ws);
-  const room = rooms.get(client.roomId);
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
+
+  const room = rooms.get(clientInfo.roomId);
   if (!room) return;
 
-  const targetId = data.targetId;
-  const lines = data.lines;
+  // ランダムなターゲット選択
+  const alivePlayers = Array.from(room.players.values())
+    .filter(p => p.isAlive && p.id !== clientInfo.id);
 
-  if (targetId === 'random') {
-    // ランダムな生存プレイヤーに攻撃
-    const alivePlayers = Array.from(room.players.values())
-      .filter(p => p.isAlive && p.id !== client.id);
+  if (alivePlayers.length > 0) {
+    const target = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
     
-    if (alivePlayers.length > 0) {
-      const target = alivePlayers[Math.floor(Math.random() * alivePlayers.length)];
-      target.attackQueue += lines;
-      
+    if (target.ws && target.ws.readyState === WebSocket.OPEN) {
       target.ws.send(JSON.stringify({
         type: 'attacked',
-        lines: lines,
-        fromPlayer: client.name
-      }));
-    }
-  } else {
-    // 特定プレイヤーに攻撃
-    const target = room.players.get(targetId);
-    if (target && target.isAlive) {
-      target.attackQueue += lines;
-      
-      target.ws.send(JSON.stringify({
-        type: 'attacked',
-        lines: lines,
-        fromPlayer: client.name
+        fromPlayerId: clientInfo.id,
+        lines: data.lines || 1
       }));
     }
   }
 }
 
-// HTTPエンドポイント
+function handleChat(ws, data) {
+  const clientInfo = clients.get(ws);
+  if (!clientInfo.roomId) return;
+
+  broadcastToRoom(clientInfo.roomId, {
+    type: 'chat',
+    username: clientInfo.username,
+    message: data.message
+  });
+}
+
+// ヘルスチェック
 app.get('/', (req, res) => {
   res.json({
-    name: 'Tetris Online Server',
-    status: 'running',
+    status: 'ok',
     rooms: rooms.size,
     players: clients.size,
-    uptime: process.uptime()
+    queues: Object.entries(rankQueues).reduce((acc, [rank, queue]) => {
+      acc[rank] = queue.length;
+      return acc;
+    }, {})
   });
 });
-
-app.get('/keepalive', (req, res) => {
-  res.json({ status: 'alive', timestamp: Date.now() });
-});
-
-app.get('/stats', (req, res) => {
-  res.json({
-    rooms: rooms.size,
-    players: clients.size,
-    quickMatchQueue: quickMatchQueue.size
-  });
-});
-
-// Keep-alive設定（Renderスリープ対策）
-if (KEEPALIVE_URL) {
-  // 14分ごとに自分自身にアクセス
-  cron.schedule('*/14 * * * *', async () => {
-    try {
-      const https = require('https');
-      https.get(KEEPALIVE_URL, (res) => {
-        console.log(`Keep-alive ping: ${res.statusCode}`);
-      });
-    } catch (error) {
-      console.error('Keep-alive error:', error);
-    }
-  });
-  console.log('Keep-alive scheduled');
-}
 
 // サーバー起動
 server.listen(PORT, () => {
   console.log(`Tetris server running on port ${PORT}`);
-});
-
-// クリーンアップ
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server...');
-  wss.clients.forEach((client) => {
-    client.close();
-  });
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+  console.log(`Config:`, CONFIG);
 });
